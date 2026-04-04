@@ -118,10 +118,37 @@ alter table viewers         enable row level security;
 alter table stream_commands enable row level security;
 
 -- Service-role key bypasses RLS automatically (Supabase behaviour).
--- Add per-user policies here when you introduce auth, e.g.:
 --
---   create policy "Authenticated users can read creators"
---     on creators for select using (auth.role() = 'authenticated');
+-- Phase 1: allow any authenticated user to read public data, and only the
+-- service role (backend) to write.  Expand these as you add user accounts.
+
+-- creators — public read (dashboard/viewers can browse), service-only write
+create policy "Anyone authenticated can read creators"
+  on creators for select
+  using (auth.role() = 'authenticated');
+
+-- stream_sessions — authenticated read, service-only write
+create policy "Anyone authenticated can read sessions"
+  on stream_sessions for select
+  using (auth.role() = 'authenticated');
+
+-- stream_events — authenticated read, service-only write
+create policy "Anyone authenticated can read events"
+  on stream_events for select
+  using (auth.role() = 'authenticated');
+
+-- viewers — service-only (internal use, not exposed to dashboard users yet)
+-- No policy added; RLS blocks all non-service access by default.
+
+-- stream_commands — authenticated insert (dashboard can send commands),
+-- service-only update/delete
+create policy "Authenticated users can insert commands"
+  on stream_commands for insert
+  with check (auth.role() = 'authenticated');
+
+create policy "Authenticated users can read their commands"
+  on stream_commands for select
+  using (auth.role() = 'authenticated');
 
 -- =============================================================================
 -- updated_at trigger for creators
