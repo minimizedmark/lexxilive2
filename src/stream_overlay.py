@@ -2,6 +2,8 @@
 Core stream overlay engine.
 Captures webcam, composites the AI influencer avatar, and outputs to window
 and/or virtual camera and/or RTMP stream.
+
+Voice and avatar switch together atomically when the operator presses N/P/1-9.
 """
 
 import cv2
@@ -10,8 +12,10 @@ import time
 from pathlib import Path
 
 from .detector import FaceDetector, BodySegmenter
-from .avatar import AvatarDeck
+from .avatar import AvatarDeck, AvatarManager
 from .compositor import Compositor
+from .creator import Creator, discover_creators
+from .voice import VoiceEngine
 
 
 MODES = ['face', 'replace', 'overlay', 'pip']
@@ -31,11 +35,12 @@ class AIInfluencerStream:
     Keyboard controls (window must be focused):
       Q / ESC      Quit
       M            Cycle overlay mode
-      N / →        Next avatar
-      P / ←        Previous avatar
-      1-9          Jump to avatar by position
+      N / →        Next creator / avatar
+      P / ←        Previous creator / avatar
+      1–9          Jump to creator by slot
       +  /  =      Increase opacity
       -             Decrease opacity
+      V             Toggle voice conversion on/off
       R             Reload current avatar from disk
       S             Save screenshot
       H             Toggle help overlay
@@ -43,19 +48,29 @@ class AIInfluencerStream:
 
     def __init__(
         self,
+        # Visual
         avatar_path: str = 'assets/avatar.png',
         avatar_dir: str = '',
+        creators_dir: str = 'creators',
+        # Camera
         camera_id: int = 0,
         width: int = 1280,
         height: int = 720,
         fps: int = 30,
+        flip_camera: bool = True,
+        # Overlay
         mode: str = 'face',
         opacity: float = 0.92,
+        avatar_scale: float = 2.6,
+        transition_frames: int = 12,
+        # Streaming output
         use_virtual_cam: bool = False,
         rtmp_url: str = '',
-        avatar_scale: float = 2.6,
-        flip_camera: bool = True,
-        transition_frames: int = 12,
+        # Voice
+        voice_enabled: bool = True,
+        voice_input_device=None,
+        voice_output_device=None,
+        rvc_api_url: str = '',
     ):
         self.width = width
         self.height = height
@@ -66,38 +81,63 @@ class AIInfluencerStream:
         self.rtmp_url = rtmp_url
         self.avatar_scale = avatar_scale
         self.flip_camera = flip_camera
+        self.voice_enabled = voice_enabled
 
         self.show_help = False
         self._frame_count = 0
         self._fps_display = 0
         self._fps_timer = time.time()
 
-        # Toast notification (shown briefly when avatar switches)
         self._toast_msg: str = ''
         self._toast_until: float = 0.0
 
-        # Smoothed face / body position (EMA)
+        # EMA smoothing state for face / body tracking
         self._smooth_x: float | None = None
         self._smooth_y: float | None = None
         self._smooth_w: float | None = None
         self._smooth_h: float | None = None
         self._smooth_tilt: float = 0.0
-        # 0.6 = tight/responsive; lower = smoother but laggier
         self._smooth_alpha = 0.60
 
+        # ------------------------------------------------------------------
+        # Build creator / avatar sources
+        # ------------------------------------------------------------------
+        # Priority: creators/ dir > avatar-dir > single avatar file
+
+        self._creators: list[Creator] = []
+        creator_paths = Path(creators_dir)
+        if creator_paths.is_dir():
+            self._creators = discover_creators(creator_paths)
+
+        # Build AvatarDeck:
+        #   - If creators found: each creator contributes its avatar
+        #   - Otherwise: fall back to --avatar-dir / --avatar
+        if self._creators:
+            from .avatar import AvatarManager
+            print(f"[Stream] Using {len(self._creators)} creator profile(s) "
+                  f"from '{creators_dir}'.")
+            self.deck = _CreatorAvatarDeck(
+                self._creators, transition_frames=transition_frames)
+        else:
+            print("[Stream] No creator profiles found – using avatar deck.")
+            self.deck = AvatarDeck(
+                avatar_path=avatar_path,
+                avatar_dir=avatar_dir,
+                transition_frames=transition_frames,
+            )
+
+        # ------------------------------------------------------------------
+        # Camera
+        # ------------------------------------------------------------------
         print("[Stream] Initialising camera…")
         self.cap = cv2.VideoCapture(camera_id)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv2.CAP_PROP_FPS, fps)
 
-        print("[Stream] Loading avatar deck…")
-        self.deck = AvatarDeck(
-            avatar_path=avatar_path,
-            avatar_dir=avatar_dir,
-            transition_frames=transition_frames,
-        )
-
+        # ------------------------------------------------------------------
+        # Detection
+        # ------------------------------------------------------------------
         print("[Stream] Initialising face detector…")
         self.face_detector = FaceDetector()
 
@@ -106,6 +146,24 @@ class AIInfluencerStream:
 
         self.compositor = Compositor()
 
+        # ------------------------------------------------------------------
+        # Voice engine
+        # ------------------------------------------------------------------
+        print("[Stream] Initialising voice engine…")
+        self.voice = VoiceEngine(
+            input_device=voice_input_device,
+            output_device=voice_output_device,
+            api_url=rvc_api_url,
+        )
+        if voice_enabled:
+            self._load_voice_for_current()
+            self.voice.start()
+        else:
+            print("[Stream] Voice conversion disabled (--no-voice).")
+
+        # ------------------------------------------------------------------
+        # Streaming outputs
+        # ------------------------------------------------------------------
         self.virtual_cam = None
         if use_virtual_cam:
             self._open_virtual_cam()
@@ -125,12 +183,10 @@ class AIInfluencerStream:
         print("[Stream] Running.  Press H for help, Q to quit.")
 
         while True:
-            # Rescan avatar directory for new files
             self.deck.scan()
 
             ret, frame = self.cap.read()
             if not ret:
-                print("[Stream] Camera read failed – retrying…")
                 time.sleep(0.05)
                 continue
 
@@ -146,7 +202,6 @@ class AIInfluencerStream:
 
             if self.virtual_cam is not None:
                 self._send_virtual(output)
-
             if self.writer is not None:
                 self.writer.write(output)
 
@@ -172,12 +227,10 @@ class AIInfluencerStream:
             return self._mode_pip(frame)
         return frame
 
-    def _current_avatar(self, width: int, height: int) -> np.ndarray:
-        """Get the current (possibly cross-fading) avatar at the given size."""
-        return self.deck.get_frame(width, height)
+    def _avatar(self, w: int, h: int) -> np.ndarray:
+        return self.deck.get_frame(w, h)
 
     def _mode_face_track(self, frame: np.ndarray) -> np.ndarray:
-        """Track face position, size, and head tilt in real time."""
         faces = self.face_detector.detect(frame)
         output = frame.copy()
 
@@ -209,23 +262,19 @@ class AIInfluencerStream:
                     dt += 180
                 self._smooth_tilt = self._smooth_tilt + a * dt
 
-        cx, cy, fw = self._smooth_x, self._smooth_y, self._smooth_w
-
-        aw = int(fw * self.avatar_scale)
+        aw = int(self._smooth_w * self.avatar_scale)
         ah = int(aw * self.deck.current.aspect_ratio)
-        avatar_cx = int(cx)
-        avatar_cy = int(cy - ah * 0.35 + ah / 2)
+        avatar_cx = int(self._smooth_x)
+        avatar_cy = int(self._smooth_y - ah * 0.35 + ah / 2)
 
-        avatar_img = self._current_avatar(aw, ah)
         return self.compositor.overlay_rgba_rotated(
-            output, avatar_img,
+            output, self._avatar(aw, ah),
             avatar_cx, avatar_cy,
             self._smooth_tilt,
             self.opacity,
         )
 
     def _mode_body_replace(self, frame: np.ndarray) -> np.ndarray:
-        """Erase person via segmentation, place avatar at their position."""
         if not self.body_segmenter.available:
             self.mode = 'face'
             return self._mode_face_track(frame)
@@ -248,7 +297,6 @@ class AIInfluencerStream:
 
         a = self._smooth_alpha
         bx, by, bw, bh = float(x + w / 2), float(y + h / 2), float(w), float(h)
-
         if self._smooth_x is None:
             self._smooth_x, self._smooth_y = bx, by
             self._smooth_w, self._smooth_h = bw, bh
@@ -263,20 +311,19 @@ class AIInfluencerStream:
         ax = int(self._smooth_x - aw / 2)
         ay = int(self._smooth_y - ah / 2)
 
-        avatar_img = self._current_avatar(aw, ah)
-        return self.compositor.overlay_rgba(background, avatar_img, ax, ay, self.opacity)
+        return self.compositor.overlay_rgba(background, self._avatar(aw, ah),
+                                            ax, ay, self.opacity)
 
     def _mode_full_overlay(self, frame: np.ndarray) -> np.ndarray:
-        avatar_img = self._current_avatar(self.width, self.height)
-        return self.compositor.overlay_rgba(frame, avatar_img, 0, 0, self.opacity)
+        return self.compositor.overlay_rgba(
+            frame, self._avatar(self.width, self.height), 0, 0, self.opacity)
 
     def _mode_pip(self, frame: np.ndarray) -> np.ndarray:
         pip_w = self.width // 4
         pip_h = int(pip_w * self.deck.current.aspect_ratio)
-        pip_x = self.width - pip_w - 16
-        pip_y = 16
-        avatar_img = self._current_avatar(pip_w, pip_h)
-        return self.compositor.overlay_rgba(frame, avatar_img, pip_x, pip_y, self.opacity)
+        return self.compositor.overlay_rgba(
+            frame, self._avatar(pip_w, pip_h),
+            self.width - pip_w - 16, 16, self.opacity)
 
     # ------------------------------------------------------------------
     # UI
@@ -296,25 +343,41 @@ class AIInfluencerStream:
         text(MODE_DESCRIPTIONS[self.mode], 10, 60)
         text(f'Opacity: {self.opacity:.0%}', 10, 90)
 
-        # Avatar indicator
-        deck = self.deck
-        avatar_label = (f'Avatar [{deck.index + 1}/{deck.count}]: '
-                        f'{deck.current.name}')
-        if deck.in_transition:
-            avatar_label += '  ↔'
-        text(avatar_label, 10, 120, color=(255, 200, 60))
+        # Creator / avatar indicator
+        creator = self._current_creator()
+        if creator:
+            label = (f'[{self.deck.index + 1}/{self.deck.count}] '
+                     f'{creator.name}')
+            voice_icon = '  MIC ON' if (self.voice_enabled and creator.has_voice) else ''
+            text(label + voice_icon,
+                 10, 120, color=(255, 200, 60))
+            if creator.description:
+                text(creator.description[:60], 10, 148,
+                     scale=0.5, color=(180, 180, 180), thickness=1)
+        else:
+            label = (f'Avatar [{self.deck.index + 1}/{self.deck.count}]: '
+                     f'{self.deck.current.name}')
+            if self.deck.in_transition:
+                label += '  ↔'
+            text(label, 10, 120, color=(255, 200, 60))
 
-        text('[H] help  [N/P] avatar  [M] mode  [Q] quit', 10, h - 14,
-             scale=0.5, color=(200, 200, 200))
+        # Voice status bar
+        if self.voice_enabled:
+            vcol = (0, 255, 120) if self.voice.is_running else (80, 80, 80)
+            vname = self.voice.current_creator or 'passthrough'
+            text(f'VOICE: {vname}', 10, 150 if not creator else 172,
+                 scale=0.55, color=vcol, thickness=1)
 
-        # Toast notification
+        text('[H] help  [N/P] switch  [V] voice  [Q] quit',
+             10, h - 14, scale=0.5, color=(200, 200, 200))
+
+        # Toast
         if time.time() < self._toast_until:
-            tw, th = cv2.getTextSize(
-                self._toast_msg, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)[0]
-            tx = (w - tw) // 2
-            ty = h // 2
-            cv2.rectangle(out, (tx - 14, ty - th - 10),
-                          (tx + tw + 14, ty + 10), (20, 20, 20), -1)
+            tw = cv2.getTextSize(self._toast_msg,
+                                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)[0][0]
+            tx, ty = (w - tw) // 2, h // 2
+            cv2.rectangle(out, (tx - 14, ty - 30), (tx + tw + 14, ty + 12),
+                          (20, 20, 20), -1)
             text(self._toast_msg, tx, ty, scale=0.9,
                  color=(255, 240, 80), thickness=2)
 
@@ -323,25 +386,25 @@ class AIInfluencerStream:
                 'KEYBOARD CONTROLS',
                 'Q / ESC   – Quit',
                 'M         – Cycle overlay mode',
-                'N / →     – Next avatar',
-                'P / ←     – Previous avatar',
-                '1 – 9     – Jump to avatar #',
+                'N / →     – Next creator',
+                'P / ←     – Previous creator',
+                '1 – 9     – Jump to creator slot',
+                'V         – Toggle voice on/off',
                 '+  /  =   – Increase opacity',
                 '-         – Decrease opacity',
                 'R         – Reload current avatar',
                 'S         – Save screenshot',
                 'H         – Toggle this help',
             ]
-            pw = 360
-            panel_x = w - pw - 10
+            panel_x = w - 370
             panel_y = 20
             cv2.rectangle(out, (panel_x - 10, panel_y - 10),
                           (w - 10, panel_y + len(lines) * 28 + 10),
                           (20, 20, 20), -1)
             for i, line in enumerate(lines):
-                color = (255, 220, 60) if i == 0 else (220, 220, 220)
+                clr = (255, 220, 60) if i == 0 else (220, 220, 220)
                 text(line, panel_x, panel_y + i * 28 + 20,
-                     scale=0.58, color=color, thickness=1)
+                     scale=0.58, color=clr, thickness=1)
 
         return out
 
@@ -353,45 +416,81 @@ class AIInfluencerStream:
         if key == ord('m'):
             idx = MODES.index(self.mode)
             self.mode = MODES[(idx + 1) % len(MODES)]
-            # Reset smoothing state when mode changes
             self._smooth_x = self._smooth_y = None
             self._smooth_w = self._smooth_h = None
             print(f"[Stream] Mode → {self.mode}")
 
-        elif key in (ord('n'), 0x27):       # N or right-arrow
+        elif key in (ord('n'), 0x27):   # N or right-arrow
             self.deck.next()
-            self._toast(f'{self.deck.current.name}  [{self.deck.index + 1}/{self.deck.count}]')
+            self._on_creator_switch()
 
-        elif key in (ord('p'), 0x25):       # P or left-arrow
+        elif key in (ord('p'), 0x25):   # P or left-arrow
             self.deck.prev()
-            self._toast(f'{self.deck.current.name}  [{self.deck.index + 1}/{self.deck.count}]')
+            self._on_creator_switch()
 
         elif ord('1') <= key <= ord('9'):
-            slot = key - ord('1')           # 0-based
-            self.deck.select(slot)
-            self._toast(f'{self.deck.current.name}  [{self.deck.index + 1}/{self.deck.count}]')
+            self.deck.select(key - ord('1'))
+            self._on_creator_switch()
+
+        elif key == ord('v'):
+            self.voice_enabled = not self.voice_enabled
+            if self.voice_enabled:
+                self._load_voice_for_current()
+                if not self.voice.is_running:
+                    self.voice.start()
+                print("[Stream] Voice ON")
+            else:
+                self.voice.load_passthrough()
+                print("[Stream] Voice OFF")
 
         elif key in (ord('+'), ord('=')):
             self.opacity = min(1.0, self.opacity + 0.05)
-
         elif key == ord('-'):
             self.opacity = max(0.05, self.opacity - 0.05)
-
         elif key == ord('r'):
             self.deck.reload_current()
-
         elif key == ord('s'):
             self._save_screenshot()
-
         elif key == ord('h'):
             self.show_help = not self.show_help
 
-    def _toast(self, msg: str, duration: float = 1.8):
+    def _on_creator_switch(self):
+        """Called whenever the active creator/avatar changes."""
+        creator = self._current_creator()
+        if creator:
+            name = creator.name
+            slot = f'[{self.deck.index + 1}/{self.deck.count}]'
+            self._toast(f'{slot} {name}')
+            if self.voice_enabled:
+                self._load_voice_for_current()
+        else:
+            name = self.deck.current.name
+            self._toast(f'{name}  [{self.deck.index + 1}/{self.deck.count}]')
+
+    def _load_voice_for_current(self):
+        """Load the voice model that matches the currently active creator."""
+        creator = self._current_creator()
+        if creator and creator.has_voice:
+            self.voice.load(
+                model_path=creator.voice_model_path,
+                index_path=creator.voice_index_path,
+                pitch_shift=creator.pitch_shift,
+            )
+        else:
+            self.voice.load_passthrough()
+
+    def _current_creator(self) -> Creator | None:
+        """Return the Creator object for the active slot, if using creator mode."""
+        if isinstance(self.deck, _CreatorAvatarDeck):
+            return self.deck.current_creator()
+        return None
+
+    def _toast(self, msg: str, duration: float = 2.0):
         self._toast_msg = msg
         self._toast_until = time.time() + duration
 
     # ------------------------------------------------------------------
-    # Virtual camera / RTMP / screenshot
+    # Virtual cam / RTMP / screenshot
     # ------------------------------------------------------------------
 
     def _open_virtual_cam(self):
@@ -401,11 +500,9 @@ class AIInfluencerStream:
                 width=self.width, height=self.height, fps=self.fps,
                 fmt=pyvirtualcam.PixelFormat.BGR,
             )
-            print(f"[Stream] Virtual camera active: {self.virtual_cam.device}")
+            print(f"[Stream] Virtual camera: {self.virtual_cam.device}")
         except ImportError:
             print("[Stream] pyvirtualcam not installed – virtual camera disabled.")
-            print("         pip install pyvirtualcam")
-            print("         Linux also needs:  sudo modprobe v4l2loopback")
         except Exception as e:
             print(f"[Stream] Virtual camera error: {e}")
 
@@ -418,13 +515,10 @@ class AIInfluencerStream:
 
     def _open_rtmp(self, url: str):
         fourcc = cv2.VideoWriter_fourcc(*'H264')
-        self.writer = cv2.VideoWriter(
-            url, fourcc, self.fps, (self.width, self.height))
+        self.writer = cv2.VideoWriter(url, fourcc, self.fps, (self.width, self.height))
         if not self.writer.isOpened():
-            print(f"[Stream] WARNING: Could not open RTMP writer for {url}")
+            print(f"[Stream] WARNING: could not open RTMP writer for {url}")
             self.writer = None
-        else:
-            print(f"[Stream] RTMP streaming to: {url}")
 
     def _save_screenshot(self):
         fname = f'screenshot_{int(time.time())}.png'
@@ -438,10 +532,6 @@ class AIInfluencerStream:
             cv2.imwrite(fname, out)
             print(f"[Stream] Screenshot saved: {fname}")
 
-    # ------------------------------------------------------------------
-    # FPS tracking / cleanup
-    # ------------------------------------------------------------------
-
     def _update_fps(self):
         self._frame_count += 1
         now = time.time()
@@ -451,6 +541,7 @@ class AIInfluencerStream:
             self._fps_timer = now
 
     def _cleanup(self):
+        self.voice.stop()
         self.cap.release()
         cv2.destroyAllWindows()
         if self.virtual_cam is not None:
@@ -461,3 +552,36 @@ class AIInfluencerStream:
         if self.writer is not None:
             self.writer.release()
         print("[Stream] Stopped.")
+
+
+# ---------------------------------------------------------------------------
+# Internal: AvatarDeck subclass that is backed by Creator objects
+# ---------------------------------------------------------------------------
+
+class _CreatorAvatarDeck(AvatarDeck):
+    """
+    Wraps a list of Creator objects as an AvatarDeck.
+    Each creator's avatar becomes one deck slot.
+    """
+
+    def __init__(self, creators: list[Creator], transition_frames: int = 12):
+        # Bypass AvatarDeck.__init__ – we build managers directly
+        self._dir = None
+        self._transition_frames = max(1, transition_frames)
+        self._managers = []
+        self._index = 0
+        self._prev_manager = None
+        self._transition_progress = 1.0
+        self._dir_mtime = 0.0
+        self._last_scan = 0.0
+
+        self._creators = creators
+        for c in creators:
+            self._managers.append(AvatarManager(c.avatar_path))
+
+    def current_creator(self) -> Creator:
+        return self._creators[self._index]
+
+    # Override scan() – creators dir scanning is handled by discover_creators()
+    def scan(self):
+        pass

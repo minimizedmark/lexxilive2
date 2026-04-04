@@ -1,9 +1,24 @@
+# Core video / CV
 opencv-python>=4.8.0
 mediapipe>=0.10.0
 numpy>=1.24.0
 Pillow>=10.0.0
+
+# Avatar generation
 anthropic>=0.25.0
 requests>=2.31.0
 rembg>=2.0.50
 onnxruntime>=1.16.0
-pyvirtualcam>=0.10.0
+
+# Voice conversion
+sounddevice>=0.4.6
+soundfile>=0.12.1
+scipy>=1.11.0
+
+# RVC local inference (optional – GPU strongly recommended)
+# Uncomment one of:
+# infer-rvc-python>=0.2.0        # pip-packaged RVC wrapper (CPU/GPU)
+# torch>=2.0.0                   # required by infer-rvc-python
+
+# Streaming output
+pyvirtualcam>=0.10.0              # virtual camera device (also needs v4l2loopback on Linux)
