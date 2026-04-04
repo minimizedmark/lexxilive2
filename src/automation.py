@@ -29,10 +29,13 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
 
-from .brain   import Brain, CreatorPersona, StreamEvent, EventType, SpeakRequest
-from .tts     import TTSEngine
-from .lipsync import AmplitudeLipSync, AvatarAnimator, AnimationState
-from .creator import Creator
+from .brain     import Brain, CreatorPersona, StreamEvent, EventType, SpeakRequest
+from .tts       import TTSEngine
+from .lipsync   import AmplitudeLipSync, AvatarAnimator, AnimationState
+from .creator   import Creator
+from .animation import AnimationController, Reaction
+from .reactions import ReactionEngine, StimulusType
+from .hardware  import HardwareManager
 
 
 class StreamState(Enum):
@@ -80,6 +83,17 @@ class AutomationEngine:
         self.lipsync      = AmplitudeLipSync(self.anim_state)
         self.animator     = AvatarAnimator(self.anim_state)
 
+        # Physical animation + reaction engine
+        self.anim_ctrl    = AnimationController()
+        self.reactions    = ReactionEngine(
+            self.anim_ctrl,
+            on_state_change=self._on_emotion_change,
+        )
+
+        # Hardware (lights etc.) — drivers added externally via
+        # engine.hardware.add(WLEDDriver(...))
+        self.hardware     = HardwareManager()
+
         # Connect TTS callbacks to lip sync
         self.tts.on_start = self._on_tts_start
         self.tts.on_end   = self._on_tts_end
@@ -126,30 +140,22 @@ class AutomationEngine:
     def start(self):
         self._running = True
 
-        # Start TTS engine
         self.tts.start()
-
-        # Start brain
         self.brain.start()
+        self.reactions.start()
 
-        # Start chat readers
         for reader in self._chat_readers:
             reader.start()
 
-        # Event dispatch thread (brain feed)
         self._dispatch_thread = threading.Thread(
             target=self._dispatch_loop, daemon=True, name='auto-dispatch')
         self._dispatch_thread.start()
 
-        # Priority speak queue → TTS thread
         self._speak_thread = threading.Thread(
             target=self._speak_loop, daemon=True, name='auto-speak')
         self._speak_thread.start()
 
-        # Fire STREAM_START event
-        self.event_queue.put_nowait(
-            StreamEvent(type=EventType.STREAM_START))
-
+        self.event_queue.put_nowait(StreamEvent(type=EventType.STREAM_START))
         print(f"[Auto] Engine started.  Mode: {self.mode}  "
               f"Persona: {self.persona.name}")
 
@@ -163,6 +169,8 @@ class AutomationEngine:
 
         self.brain.stop()
         self.tts.stop()
+        self.reactions.stop()
+        self.hardware.off_all()
 
         for t in (self._dispatch_thread, self._speak_thread):
             if t:
@@ -174,12 +182,28 @@ class AutomationEngine:
     # Per-frame call (used by stream_overlay compositor)
     # ------------------------------------------------------------------
 
-    def get_avatar_frame(self, avatar_rgba):
+    def get_avatar_frame(self, avatar_rgba, output_frame=None):
         """
-        Apply lip sync and blink animation to a base avatar RGBA frame.
-        Call this once per rendered video frame.
+        Apply lip sync, blink, expression, and spring-physics animation
+        to the avatar RGBA frame each video frame.
+
+        output_frame is the current BGR canvas — particles are drawn onto it.
+        Returns (animated_avatar_rgba, transform) where transform carries the
+        physics offset/scale/rotation for the compositor to apply.
         """
-        return self.animator.apply(avatar_rgba)
+        import numpy as np
+
+        # 1. Lip sync + blink from AmplitudeLipSync
+        lip_animated = self.animator.apply(avatar_rgba)
+
+        # 2. Expression + spring physics from AnimationController
+        if output_frame is None:
+            output_frame = np.zeros(
+                (self.anim_ctrl.canvas_h, self.anim_ctrl.canvas_w, 3),
+                dtype=np.uint8)
+
+        final_avatar, transform = self.anim_ctrl.apply(lip_animated, output_frame)
+        return final_avatar, transform
 
     def calibrate_avatar(self, avatar_rgba):
         """
@@ -210,6 +234,15 @@ class AutomationEngine:
     # ------------------------------------------------------------------
 
     def _dispatch_loop(self):
+        # Map stream event types to physical stimuli
+        _event_stimulus = {
+            EventType.RAID:         (StimulusType.RAID,        'raid',    1.2),
+            EventType.SUBSCRIPTION: (StimulusType.SUBSCRIPTION,'sub',     1.0),
+            EventType.GIFTED_SUB:   (StimulusType.GIFTED_SUB,  'gifted',  1.1),
+            EventType.DONATION:     (StimulusType.DONATION,    'donation',1.0),
+            EventType.BITS:         (StimulusType.BITS,        'bits',    0.8),
+            EventType.FOLLOW:       (StimulusType.FOLLOW,      'follow',  0.6),
+        }
         while self._running:
             try:
                 event = self.event_queue.get(timeout=2.0)
@@ -218,6 +251,16 @@ class AutomationEngine:
             if event is None:
                 break
             self.state = StreamState.LISTENING
+
+            # Trigger physical reaction + hardware
+            entry = _event_stimulus.get(event.type)
+            if entry:
+                stim, hw_tag, intensity = entry
+                self.reactions.stimulate(stim, intensity=intensity)
+                self.hardware.on_event(hw_tag)
+            elif event.type == EventType.CHAT_MESSAGE:
+                self.reactions.stimulate(StimulusType.FUNNY, intensity=0.3)
+
             self.brain.push_event(event)
 
     # ------------------------------------------------------------------
@@ -226,7 +269,15 @@ class AutomationEngine:
 
     def _on_brain_speak(self, req: SpeakRequest):
         """Called by Brain when it wants to say something."""
+        # Parse emotion from the text before queuing
+        self.reactions.set_emotion_from_text(req.text)
+        # Talking reaction — subtle nod
+        self.reactions.anim.trigger(Reaction.TALKING)
         self._speak_q.put_nowait((req.priority, time.time(), req.text))
+
+    def _on_emotion_change(self, state):
+        """Called by ReactionEngine when emotional label changes."""
+        self.hardware.on_emotion(state)
 
     def _speak_loop(self):
         while self._running:

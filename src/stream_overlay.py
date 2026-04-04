@@ -282,12 +282,15 @@ class AIInfluencerStream:
             return self._mode_pip(frame)
         return frame
 
-    def _avatar(self, w: int, h: int) -> np.ndarray:
+    def _avatar(self, w: int, h: int, output_frame=None):
         base = self.deck.get_frame(w, h)
-        # Apply lip sync / blink animation in auto mode
-        if self.automation is not None and base is not None:
-            base = self.automation.get_avatar_frame(base)
-        return base
+        if base is None:
+            return base, None
+        if self.automation is not None:
+            animated, transform = self.automation.get_avatar_frame(
+                base, output_frame)
+            return animated, transform
+        return base, None
 
     def _mode_face_track(self, frame: np.ndarray) -> np.ndarray:
         faces = self.face_detector.detect(frame)
@@ -326,12 +329,15 @@ class AIInfluencerStream:
         avatar_cx = int(self._smooth_x)
         avatar_cy = int(self._smooth_y - ah * 0.35 + ah / 2)
 
+        avatar_img, phys_t = self._avatar(aw, ah, output)
+        if phys_t is not None:
+            phys_t.rotation += self._smooth_tilt
+            return self.compositor.overlay_with_transform(
+                output, avatar_img, avatar_cx, avatar_cy,
+                phys_t, self.opacity)
         return self.compositor.overlay_rgba_rotated(
-            output, self._avatar(aw, ah),
-            avatar_cx, avatar_cy,
-            self._smooth_tilt,
-            self.opacity,
-        )
+            output, avatar_img, avatar_cx, avatar_cy,
+            self._smooth_tilt, self.opacity)
 
     def _mode_body_replace(self, frame: np.ndarray) -> np.ndarray:
         if not self.body_segmenter.available:
@@ -370,19 +376,24 @@ class AIInfluencerStream:
         ax = int(self._smooth_x - aw / 2)
         ay = int(self._smooth_y - ah / 2)
 
-        return self.compositor.overlay_rgba(background, self._avatar(aw, ah),
+        avatar_img, phys_t = self._avatar(aw, ah, background)
+        if phys_t is not None:
+            return self.compositor.overlay_with_transform(
+                background, avatar_img, ax + aw // 2, ay + ah // 2,
+                phys_t, self.opacity)
+        return self.compositor.overlay_rgba(background, avatar_img,
                                             ax, ay, self.opacity)
 
     def _mode_full_overlay(self, frame: np.ndarray) -> np.ndarray:
-        return self.compositor.overlay_rgba(
-            frame, self._avatar(self.width, self.height), 0, 0, self.opacity)
+        avatar_img, _ = self._avatar(self.width, self.height, frame)
+        return self.compositor.overlay_rgba(frame, avatar_img, 0, 0, self.opacity)
 
     def _mode_pip(self, frame: np.ndarray) -> np.ndarray:
         pip_w = self.width // 4
         pip_h = int(pip_w * self.deck.current.aspect_ratio)
+        avatar_img, _ = self._avatar(pip_w, pip_h, frame)
         return self.compositor.overlay_rgba(
-            frame, self._avatar(pip_w, pip_h),
-            self.width - pip_w - 16, 16, self.opacity)
+            frame, avatar_img, self.width - pip_w - 16, 16, self.opacity)
 
     # ------------------------------------------------------------------
     # UI

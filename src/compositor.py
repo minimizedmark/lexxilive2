@@ -9,6 +9,40 @@ import numpy as np
 class Compositor:
     """Blends RGBA overlays onto BGR backgrounds."""
 
+    def overlay_with_transform(self, background: np.ndarray,
+                               overlay_rgba: np.ndarray,
+                               cx: int, cy: int,
+                               transform,          # animation.Transform
+                               opacity: float = 1.0) -> np.ndarray:
+        """
+        Apply a full physics Transform (x-offset, y-offset, scale, rotation)
+        then composite the avatar at (cx+dx, cy+dy).
+        """
+        if overlay_rgba is None:
+            return background
+
+        oh, ow = overlay_rgba.shape[:2]
+
+        # Scale
+        scale = float(transform.scale)
+        if abs(scale - 1.0) > 0.001:
+            new_w = max(1, int(ow * scale))
+            new_h = max(1, int(oh * scale))
+            overlay_rgba = cv2.resize(overlay_rgba, (new_w, new_h),
+                                       interpolation=cv2.INTER_LINEAR)
+            oh, ow = new_h, new_w
+
+        # Rotation + translate
+        final_cx = int(cx + transform.x)
+        final_cy = int(cy + transform.y)
+
+        return self.overlay_rgba_rotated(
+            background, overlay_rgba,
+            final_cx, final_cy,
+            transform.rotation,
+            opacity,
+        )
+
     def overlay_rgba_rotated(self, background: np.ndarray, overlay_rgba: np.ndarray,
                               cx: int, cy: int, angle_deg: float,
                               opacity: float = 1.0) -> np.ndarray:

@@ -22,3 +22,8 @@ scipy>=1.11.0
 
 # Streaming output
 pyvirtualcam>=0.10.0              # virtual camera device (also needs v4l2loopback on Linux)
+
+# Hardware integration (all optional — install only what you use)
+# phue>=1.1              # Philips Hue
+# pyserial>=3.5          # Arduino / serial LED rigs
+# pyttsx3>=2.90          # system TTS fallback
