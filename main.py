@@ -44,8 +44,12 @@ def parse_args():
         epilog=__doc__,
     )
     p.add_argument('--avatar', default='assets/avatar.png',
-                   help='Path to AI influencer PNG (with alpha transparency). '
+                   help='Path to a single AI influencer PNG (with alpha transparency). '
                         'Default: assets/avatar.png')
+    p.add_argument('--avatar-dir', default='',
+                   help='Directory of avatar PNGs.  All images are loaded into a deck '
+                        'and you can switch between them live with N/P/1-9 keys.  '
+                        'The directory is watched for new files while running.')
     p.add_argument('--camera', type=int, default=0,
                    help='Camera device index (default: 0)')
     p.add_argument('--width', type=int, default=1280)
@@ -67,6 +71,8 @@ def parse_args():
                    help='Output to virtual camera device (requires pyvirtualcam + v4l2loopback)')
     p.add_argument('--rtmp', default='',
                    help='RTMP URL for direct streaming, e.g. rtmp://live.twitch.tv/app/<key>')
+    p.add_argument('--transition', type=int, default=12,
+                   help='Crossfade duration in frames when switching avatars (default: 12)')
     return p.parse_args()
 
 
@@ -77,6 +83,8 @@ def main():
     print("  AI Influencer Live Stream Overlay")
     print("=" * 60)
     print(f"  Avatar : {args.avatar}")
+    if args.avatar_dir:
+        print(f"  Dir    : {args.avatar_dir}  (N/P/1-9 to switch)")
     print(f"  Camera : {args.camera}  ({args.width}x{args.height} @ {args.fps}fps)")
     print(f"  Mode   : {args.mode}")
     print(f"  Opacity: {args.opacity:.0%}")
@@ -88,6 +96,7 @@ def main():
 
     stream = AIInfluencerStream(
         avatar_path=args.avatar,
+        avatar_dir=args.avatar_dir,
         camera_id=args.camera,
         width=args.width,
         height=args.height,
@@ -98,6 +107,7 @@ def main():
         rtmp_url=args.rtmp,
         avatar_scale=args.scale,
         flip_camera=not args.no_flip,
+        transition_frames=args.transition,
     )
     stream.run()
 

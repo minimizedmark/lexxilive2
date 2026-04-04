@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 from .detector import FaceDetector, BodySegmenter
-from .avatar import AvatarManager
+from .avatar import AvatarDeck
 from .compositor import Compositor
 
 
@@ -29,18 +29,22 @@ class AIInfluencerStream:
     Main processing class.  Call run() to start the event loop.
 
     Keyboard controls (window must be focused):
-      Q / ESC   Quit
-      M         Cycle overlay mode
-      +  /  =   Increase opacity
-      -          Decrease opacity
-      R          Reload avatar from disk
-      S          Save screenshot
-      H          Toggle help overlay
+      Q / ESC      Quit
+      M            Cycle overlay mode
+      N / →        Next avatar
+      P / ←        Previous avatar
+      1-9          Jump to avatar by position
+      +  /  =      Increase opacity
+      -             Decrease opacity
+      R             Reload current avatar from disk
+      S             Save screenshot
+      H             Toggle help overlay
     """
 
     def __init__(
         self,
         avatar_path: str = 'assets/avatar.png',
+        avatar_dir: str = '',
         camera_id: int = 0,
         width: int = 1280,
         height: int = 720,
@@ -51,8 +55,8 @@ class AIInfluencerStream:
         rtmp_url: str = '',
         avatar_scale: float = 2.6,
         flip_camera: bool = True,
+        transition_frames: int = 12,
     ):
-        self.avatar_path = avatar_path
         self.width = width
         self.height = height
         self.fps = fps
@@ -68,14 +72,17 @@ class AIInfluencerStream:
         self._fps_display = 0
         self._fps_timer = time.time()
 
-        # Smoothed face position (exponential moving average)
-        # High alpha = more responsive, low alpha = smoother/laggier
+        # Toast notification (shown briefly when avatar switches)
+        self._toast_msg: str = ''
+        self._toast_until: float = 0.0
+
+        # Smoothed face / body position (EMA)
         self._smooth_x: float | None = None
         self._smooth_y: float | None = None
         self._smooth_w: float | None = None
         self._smooth_h: float | None = None
         self._smooth_tilt: float = 0.0
-        # 0.6 gives tight, near-real-time tracking; lower if you want silky smoothing
+        # 0.6 = tight/responsive; lower = smoother but laggier
         self._smooth_alpha = 0.60
 
         print("[Stream] Initialising camera…")
@@ -84,8 +91,12 @@ class AIInfluencerStream:
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv2.CAP_PROP_FPS, fps)
 
-        print("[Stream] Loading avatar…")
-        self.avatar = AvatarManager(avatar_path, width, height)
+        print("[Stream] Loading avatar deck…")
+        self.deck = AvatarDeck(
+            avatar_path=avatar_path,
+            avatar_dir=avatar_dir,
+            transition_frames=transition_frames,
+        )
 
         print("[Stream] Initialising face detector…")
         self.face_detector = FaceDetector()
@@ -114,6 +125,9 @@ class AIInfluencerStream:
         print("[Stream] Running.  Press H for help, Q to quit.")
 
         while True:
+            # Rescan avatar directory for new files
+            self.deck.scan()
+
             ret, frame = self.cap.read()
             if not ret:
                 print("[Stream] Camera read failed – retrying…")
@@ -158,16 +172,16 @@ class AIInfluencerStream:
             return self._mode_pip(frame)
         return frame
 
+    def _current_avatar(self, width: int, height: int) -> np.ndarray:
+        """Get the current (possibly cross-fading) avatar at the given size."""
+        return self.deck.get_frame(width, height)
+
     def _mode_face_track(self, frame: np.ndarray) -> np.ndarray:
-        """
-        Track face position, size, AND head tilt in real time.
-        The avatar follows every movement including rotations.
-        """
+        """Track face position, size, and head tilt in real time."""
         faces = self.face_detector.detect(frame)
         output = frame.copy()
 
         if not faces:
-            # No face detected: keep last smoothed position
             if self._smooth_x is None:
                 return output
         else:
@@ -188,7 +202,6 @@ class AIInfluencerStream:
                 self._smooth_y = a * fy + (1 - a) * self._smooth_y
                 self._smooth_w = a * fw + (1 - a) * self._smooth_w
                 self._smooth_h = a * fh + (1 - a) * self._smooth_h
-                # Tilt needs careful interpolation to avoid wrapping artifacts
                 dt = tilt - self._smooth_tilt
                 if dt > 90:
                     dt -= 180
@@ -196,19 +209,14 @@ class AIInfluencerStream:
                     dt += 180
                 self._smooth_tilt = self._smooth_tilt + a * dt
 
-        cx = self._smooth_x
-        cy = self._smooth_y
-        fw = self._smooth_w
+        cx, cy, fw = self._smooth_x, self._smooth_y, self._smooth_w
 
         aw = int(fw * self.avatar_scale)
-        ah = int(aw * self.avatar.aspect_ratio)
-
-        # Avatar centre: horizontally aligned with face centre,
-        # shifted up so the avatar's face region (~35% from top) meets detected face
+        ah = int(aw * self.deck.current.aspect_ratio)
         avatar_cx = int(cx)
         avatar_cy = int(cy - ah * 0.35 + ah / 2)
 
-        avatar_img = self.avatar.get_resized(aw, ah)
+        avatar_img = self._current_avatar(aw, ah)
         return self.compositor.overlay_rgba_rotated(
             output, avatar_img,
             avatar_cx, avatar_cy,
@@ -217,12 +225,8 @@ class AIInfluencerStream:
         )
 
     def _mode_body_replace(self, frame: np.ndarray) -> np.ndarray:
-        """
-        Use body segmentation to erase the real person and drop the avatar
-        in their exact position, following every movement in real time.
-        """
+        """Erase person via segmentation, place avatar at their position."""
         if not self.body_segmenter.available:
-            print("[Stream] Body segmenter unavailable; falling back to face mode.")
             self.mode = 'face'
             return self._mode_face_track(frame)
 
@@ -234,7 +238,6 @@ class AIInfluencerStream:
         contours, _ = cv2.findContours(
             mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Erase person pixels
         mask3 = np.stack([mask, mask, mask], axis=-1)
         background = (frame.astype(np.float32) * (1.0 - mask3)).astype(np.uint8)
 
@@ -243,12 +246,8 @@ class AIInfluencerStream:
 
         x, y, w, h = cv2.boundingRect(max(contours, key=cv2.contourArea))
 
-        # Smooth the body bounding box for stable avatar placement
         a = self._smooth_alpha
-        bx = float(x + w / 2)
-        by = float(y + h / 2)
-        bw = float(w)
-        bh = float(h)
+        bx, by, bw, bh = float(x + w / 2), float(y + h / 2), float(w), float(h)
 
         if self._smooth_x is None:
             self._smooth_x, self._smooth_y = bx, by
@@ -260,25 +259,23 @@ class AIInfluencerStream:
             self._smooth_h = a * bh + (1 - a) * self._smooth_h
 
         ah = int(self._smooth_h)
-        aw = int(ah / self.avatar.aspect_ratio)
+        aw = int(ah / self.deck.current.aspect_ratio)
         ax = int(self._smooth_x - aw / 2)
         ay = int(self._smooth_y - ah / 2)
 
-        avatar_img = self.avatar.get_resized(aw, ah)
+        avatar_img = self._current_avatar(aw, ah)
         return self.compositor.overlay_rgba(background, avatar_img, ax, ay, self.opacity)
 
     def _mode_full_overlay(self, frame: np.ndarray) -> np.ndarray:
-        """Fill the entire frame with the avatar image."""
-        avatar_img = self.avatar.get_resized(self.width, self.height)
+        avatar_img = self._current_avatar(self.width, self.height)
         return self.compositor.overlay_rgba(frame, avatar_img, 0, 0, self.opacity)
 
     def _mode_pip(self, frame: np.ndarray) -> np.ndarray:
-        """Show camera full-frame with avatar in the top-right corner."""
         pip_w = self.width // 4
-        pip_h = int(pip_w * self.avatar.aspect_ratio)
+        pip_h = int(pip_w * self.deck.current.aspect_ratio)
         pip_x = self.width - pip_w - 16
         pip_y = 16
-        avatar_img = self.avatar.get_resized(pip_w, pip_h)
+        avatar_img = self._current_avatar(pip_w, pip_h)
         return self.compositor.overlay_rgba(frame, avatar_img, pip_x, pip_y, self.opacity)
 
     # ------------------------------------------------------------------
@@ -298,29 +295,53 @@ class AIInfluencerStream:
         text(f'FPS: {self._fps_display}', 10, 30)
         text(MODE_DESCRIPTIONS[self.mode], 10, 60)
         text(f'Opacity: {self.opacity:.0%}', 10, 90)
-        text('[H] help   [M] mode   [Q] quit', 10, h - 14, scale=0.5,
-             color=(200, 200, 200))
+
+        # Avatar indicator
+        deck = self.deck
+        avatar_label = (f'Avatar [{deck.index + 1}/{deck.count}]: '
+                        f'{deck.current.name}')
+        if deck.in_transition:
+            avatar_label += '  ↔'
+        text(avatar_label, 10, 120, color=(255, 200, 60))
+
+        text('[H] help  [N/P] avatar  [M] mode  [Q] quit', 10, h - 14,
+             scale=0.5, color=(200, 200, 200))
+
+        # Toast notification
+        if time.time() < self._toast_until:
+            tw, th = cv2.getTextSize(
+                self._toast_msg, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)[0]
+            tx = (w - tw) // 2
+            ty = h // 2
+            cv2.rectangle(out, (tx - 14, ty - th - 10),
+                          (tx + tw + 14, ty + 10), (20, 20, 20), -1)
+            text(self._toast_msg, tx, ty, scale=0.9,
+                 color=(255, 240, 80), thickness=2)
 
         if self.show_help:
             lines = [
                 'KEYBOARD CONTROLS',
-                'Q / ESC  – Quit',
-                'M        – Cycle overlay mode',
-                '+  /  =  – Increase opacity',
-                '-        – Decrease opacity',
-                'R        – Reload avatar from disk',
-                'S        – Save screenshot',
-                'H        – Toggle this help',
+                'Q / ESC   – Quit',
+                'M         – Cycle overlay mode',
+                'N / →     – Next avatar',
+                'P / ←     – Previous avatar',
+                '1 – 9     – Jump to avatar #',
+                '+  /  =   – Increase opacity',
+                '-         – Decrease opacity',
+                'R         – Reload current avatar',
+                'S         – Save screenshot',
+                'H         – Toggle this help',
             ]
-            panel_x = w - 340
+            pw = 360
+            panel_x = w - pw - 10
             panel_y = 20
             cv2.rectangle(out, (panel_x - 10, panel_y - 10),
                           (w - 10, panel_y + len(lines) * 28 + 10),
                           (20, 20, 20), -1)
             for i, line in enumerate(lines):
                 color = (255, 220, 60) if i == 0 else (220, 220, 220)
-                text(line, panel_x, panel_y + i * 28 + 20, scale=0.58,
-                     color=color, thickness=1)
+                text(line, panel_x, panel_y + i * 28 + 20,
+                     scale=0.58, color=color, thickness=1)
 
         return out
 
@@ -332,18 +353,42 @@ class AIInfluencerStream:
         if key == ord('m'):
             idx = MODES.index(self.mode)
             self.mode = MODES[(idx + 1) % len(MODES)]
+            # Reset smoothing state when mode changes
+            self._smooth_x = self._smooth_y = None
+            self._smooth_w = self._smooth_h = None
             print(f"[Stream] Mode → {self.mode}")
+
+        elif key in (ord('n'), 0x27):       # N or right-arrow
+            self.deck.next()
+            self._toast(f'{self.deck.current.name}  [{self.deck.index + 1}/{self.deck.count}]')
+
+        elif key in (ord('p'), 0x25):       # P or left-arrow
+            self.deck.prev()
+            self._toast(f'{self.deck.current.name}  [{self.deck.index + 1}/{self.deck.count}]')
+
+        elif ord('1') <= key <= ord('9'):
+            slot = key - ord('1')           # 0-based
+            self.deck.select(slot)
+            self._toast(f'{self.deck.current.name}  [{self.deck.index + 1}/{self.deck.count}]')
+
         elif key in (ord('+'), ord('=')):
             self.opacity = min(1.0, self.opacity + 0.05)
+
         elif key == ord('-'):
             self.opacity = max(0.05, self.opacity - 0.05)
+
         elif key == ord('r'):
-            ok = self.avatar.reload(self.avatar_path)
-            print(f"[Stream] Avatar reload {'OK' if ok else 'FAILED'}.")
+            self.deck.reload_current()
+
         elif key == ord('s'):
             self._save_screenshot()
+
         elif key == ord('h'):
             self.show_help = not self.show_help
+
+    def _toast(self, msg: str, duration: float = 1.8):
+        self._toast_msg = msg
+        self._toast_until = time.time() + duration
 
     # ------------------------------------------------------------------
     # Virtual camera / RTMP / screenshot
@@ -383,7 +428,6 @@ class AIInfluencerStream:
 
     def _save_screenshot(self):
         fname = f'screenshot_{int(time.time())}.png'
-        # Grab the last output frame from the window is tricky; just re-render
         ret, frame = self.cap.read()
         if ret:
             frame = cv2.resize(frame, (self.width, self.height))
@@ -395,7 +439,7 @@ class AIInfluencerStream:
             print(f"[Stream] Screenshot saved: {fname}")
 
     # ------------------------------------------------------------------
-    # FPS tracking
+    # FPS tracking / cleanup
     # ------------------------------------------------------------------
 
     def _update_fps(self):
@@ -405,10 +449,6 @@ class AIInfluencerStream:
             self._fps_display = self._frame_count
             self._frame_count = 0
             self._fps_timer = now
-
-    # ------------------------------------------------------------------
-    # Cleanup
-    # ------------------------------------------------------------------
 
     def _cleanup(self):
         self.cap.release()
