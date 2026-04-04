@@ -16,6 +16,8 @@ from .avatar import AvatarDeck, AvatarManager
 from .compositor import Compositor
 from .creator import Creator, discover_creators
 from .voice import VoiceEngine
+from .tts import TTSEngine
+from .automation import AutomationEngine
 
 
 MODES = ['face', 'replace', 'overlay', 'pip']
@@ -66,11 +68,18 @@ class AIInfluencerStream:
         # Streaming output
         use_virtual_cam: bool = False,
         rtmp_url: str = '',
-        # Voice
+        # Voice (human-operated / hybrid)
         voice_enabled: bool = True,
         voice_input_device=None,
         voice_output_device=None,
         rvc_api_url: str = '',
+        # Automation (AI-driven mode)
+        auto_mode: bool = False,
+        twitch_channel: str = '',
+        youtube_video_id: str = '',
+        youtube_channel_id: str = '',
+        elevenlabs_api_key: str = '',
+        coqui_reference_audio: str = '',
     ):
         self.width = width
         self.height = height
@@ -82,6 +91,8 @@ class AIInfluencerStream:
         self.avatar_scale = avatar_scale
         self.flip_camera = flip_camera
         self.voice_enabled = voice_enabled
+        self.auto_mode = auto_mode
+        self.automation: AutomationEngine | None = None
 
         self.show_help = False
         self._frame_count = 0
@@ -147,19 +158,63 @@ class AIInfluencerStream:
         self.compositor = Compositor()
 
         # ------------------------------------------------------------------
-        # Voice engine
+        # Voice engine (human / hybrid mode)
         # ------------------------------------------------------------------
-        print("[Stream] Initialising voice engine…")
         self.voice = VoiceEngine(
             input_device=voice_input_device,
             output_device=voice_output_device,
             api_url=rvc_api_url,
         )
-        if voice_enabled:
+        if voice_enabled and not auto_mode:
+            print("[Stream] Initialising voice engine (human mode)…")
             self._load_voice_for_current()
             self.voice.start()
-        else:
-            print("[Stream] Voice conversion disabled (--no-voice).")
+        elif not auto_mode:
+            print("[Stream] Voice conversion disabled.")
+
+        # ------------------------------------------------------------------
+        # Automation engine (AI mode)
+        # ------------------------------------------------------------------
+        if auto_mode:
+            print("[Stream] Initialising automation engine (AI mode)…")
+            current_creator = self._get_initial_creator()
+            if current_creator is None:
+                print("[Stream] WARNING: auto mode requires at least one creator profile.")
+            else:
+                tts = TTSEngine(
+                    voice_id=current_creator.directory.joinpath(
+                        'config.json').exists() and
+                        __import__('json').loads(
+                            current_creator.directory.joinpath('config.json')
+                            .read_text()).get('elevenlabs_voice_id', '') or '',
+                    output_device=voice_output_device,
+                    elevenlabs_api_key=elevenlabs_api_key,
+                    coqui_reference_audio=coqui_reference_audio
+                        or str(current_creator.directory / 'voice_sample.wav'),
+                    language=__import__('json').loads(
+                        current_creator.directory.joinpath('config.json')
+                        .read_text()).get('language', 'en')
+                        if current_creator.directory.joinpath('config.json').exists()
+                        else 'en',
+                    voice_engine=self.voice,
+                )
+                self.automation = AutomationEngine(
+                    creator=current_creator,
+                    tts_engine=tts,
+                    voice_engine=self.voice,
+                    mode='auto',
+                    twitch_channel=twitch_channel,
+                    youtube_video_id=youtube_video_id,
+                    youtube_channel_id=youtube_channel_id,
+                )
+                # Calibrate lip sync on the first avatar
+                try:
+                    first_avatar = self.deck.current.get_resized(400, 560)
+                    self.automation.calibrate_avatar(first_avatar)
+                except Exception as e:
+                    print(f"[Stream] Avatar calibration warning: {e}")
+
+                self.automation.start()
 
         # ------------------------------------------------------------------
         # Streaming outputs
@@ -221,14 +276,18 @@ class AIInfluencerStream:
             return self._mode_face_track(frame)
         elif self.mode == 'replace':
             return self._mode_body_replace(frame)
-        elif self.mode == 'overlay':
+        elif self.mode == 'overlay':  # noqa: E501 (keep elif chain readable)
             return self._mode_full_overlay(frame)
         elif self.mode == 'pip':
             return self._mode_pip(frame)
         return frame
 
     def _avatar(self, w: int, h: int) -> np.ndarray:
-        return self.deck.get_frame(w, h)
+        base = self.deck.get_frame(w, h)
+        # Apply lip sync / blink animation in auto mode
+        if self.automation is not None and base is not None:
+            base = self.automation.get_avatar_frame(base)
+        return base
 
     def _mode_face_track(self, frame: np.ndarray) -> np.ndarray:
         faces = self.face_detector.detect(frame)
@@ -361,15 +420,21 @@ class AIInfluencerStream:
                 label += '  ↔'
             text(label, 10, 120, color=(255, 200, 60))
 
-        # Voice status bar
-        if self.voice_enabled:
+        # AI automation status
+        if self.automation is not None:
+            ai_col = (100, 220, 255)
+            text(self.automation.status_line, 10, 172,
+                 scale=0.55, color=ai_col, thickness=1)
+        elif self.voice_enabled:
             vcol = (0, 255, 120) if self.voice.is_running else (80, 80, 80)
             vname = self.voice.current_creator or 'passthrough'
-            text(f'VOICE: {vname}', 10, 150 if not creator else 172,
+            text(f'VOICE: {vname}', 10, 172,
                  scale=0.55, color=vcol, thickness=1)
 
-        text('[H] help  [N/P] switch  [V] voice  [Q] quit',
-             10, h - 14, scale=0.5, color=(200, 200, 200))
+        hint = '[H] help  [N/P] switch  [Q] quit'
+        if self.automation is not None:
+            hint = '[H] help  [N/P] switch  [SPACE] inject chat  [Q] quit'
+        text(hint, 10, h - 14, scale=0.5, color=(200, 200, 200))
 
         # Toast
         if time.time() < self._toast_until:
@@ -442,6 +507,13 @@ class AIInfluencerStream:
             else:
                 self.voice.load_passthrough()
                 print("[Stream] Voice OFF")
+
+        elif key == ord(' ') and self.automation is not None:
+            # Inject a test chat message to the AI brain
+            from .automation import ManualEventInjector
+            from .brain import StreamEvent, EventType
+            injector = ManualEventInjector(self.automation)
+            injector.chat('operator', 'Hey, say something to the stream!')
 
         elif key in (ord('+'), ord('=')):
             self.opacity = min(1.0, self.opacity + 0.05)
@@ -540,7 +612,14 @@ class AIInfluencerStream:
             self._frame_count = 0
             self._fps_timer = now
 
+    def _get_initial_creator(self) -> 'Creator | None':
+        if isinstance(self.deck, _CreatorAvatarDeck):
+            return self.deck.current_creator()
+        return None
+
     def _cleanup(self):
+        if self.automation is not None:
+            self.automation.stop()
         self.voice.stop()
         self.cap.release()
         cv2.destroyAllWindows()

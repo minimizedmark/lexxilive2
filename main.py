@@ -104,6 +104,23 @@ def parse_args():
     voc.add_argument('--list-audio', action='store_true',
                      help='Print available audio devices and exit')
 
+    # ---- AI Automation ----
+    ai = p.add_argument_group('AI Automation (fully autonomous stream)')
+    ai.add_argument('--auto', action='store_true',
+                    help='Enable full AI automation: Claude brain + TTS + lip sync. '
+                         'No human operator required. Reads chat, generates responses, '
+                         'speaks as the creator, animates the avatar.')
+    ai.add_argument('--twitch', default='',
+                    help='Twitch channel to monitor for chat (e.g. lexi)')
+    ai.add_argument('--youtube-video', default='',
+                    help='YouTube live video ID to monitor')
+    ai.add_argument('--youtube-channel', default='',
+                    help='YouTube channel ID (auto-detects active livestream)')
+    ai.add_argument('--elevenlabs-key', default='',
+                    help='ElevenLabs API key for TTS (or set ELEVENLABS_API_KEY env var)')
+    ai.add_argument('--coqui-ref', default='',
+                    help='Path to reference WAV file for Coqui XTTS voice cloning')
+
     # ---- Streaming output ----
     out = p.add_argument_group('Streaming output')
     out.add_argument('--virtual-cam', action='store_true',
@@ -137,6 +154,14 @@ def main():
     print(f"  Voice        : {'OFF' if args.no_voice else 'ON'}")
     if args.rvc_api:
         print(f"  RVC API      : {args.rvc_api}")
+    if args.auto:
+        print("  AI AUTO MODE : ENABLED")
+        if args.twitch:
+            print(f"  Twitch chat  : #{args.twitch}")
+        if args.youtube_video:
+            print(f"  YouTube video: {args.youtube_video}")
+        if args.youtube_channel:
+            print(f"  YouTube chan : {args.youtube_channel}")
     if args.virtual_cam:
         print("  Virtual cam  : ENABLED")
     if args.rtmp:
@@ -167,6 +192,13 @@ def main():
         voice_input_device=args.voice_in,
         voice_output_device=args.voice_out,
         rvc_api_url=args.rvc_api,
+        # AI automation
+        auto_mode=args.auto,
+        twitch_channel=args.twitch,
+        youtube_video_id=args.youtube_video,
+        youtube_channel_id=args.youtube_channel,
+        elevenlabs_api_key=args.elevenlabs_key,
+        coqui_reference_audio=args.coqui_ref,
     )
     stream.run()
 
