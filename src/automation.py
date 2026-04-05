@@ -25,9 +25,10 @@ import threading
 import queue
 import time
 import json
-from dataclasses import dataclass
+import os
 from enum import Enum, auto
 from pathlib import Path
+from typing import Callable, Optional
 
 from .brain     import Brain, CreatorPersona, StreamEvent, EventType, SpeakRequest
 from .tts       import TTSEngine
@@ -36,6 +37,7 @@ from .creator   import Creator
 from .animation import AnimationController, Reaction
 from .reactions import ReactionEngine, StimulusType
 from .hardware  import HardwareManager
+from .supabase_bridge import SupabaseBridge
 
 
 class StreamState(Enum):
@@ -71,12 +73,21 @@ class AutomationEngine:
         youtube_video_id: str = '',
         youtube_channel_id: str = '',
         rvc_api_url: str = '',
+        bridge: Optional[SupabaseBridge] = None,
+        api_url: str = '',
     ):
         self.creator      = creator
         self.tts          = tts_engine
         self.voice_engine = voice_engine
         self.mode         = mode
         self.state        = StreamState.IDLE
+
+        # Supabase bridge — optional; connects to Node.js backend
+        self._bridge:    Optional[SupabaseBridge] = bridge
+        self._api_url:   str = api_url.rstrip('/')
+
+        # Callback set by stream_overlay so bridge can trigger creator switches
+        self.on_switch_creator: Optional[Callable[[str], None]] = None
 
         # Shared animation state (thread-safe, read by compositor each frame)
         self.anim_state   = AnimationState()
@@ -155,6 +166,15 @@ class AutomationEngine:
             target=self._speak_loop, daemon=True, name='auto-speak')
         self._speak_thread.start()
 
+        # Start Supabase bridge if configured
+        if self._bridge is not None:
+            self._bridge.on_command(self._handle_bridge_command)
+            # Auto-create a session if we have an API URL and no session yet
+            if self._api_url and not self._bridge.session_id:
+                self._create_session()
+            self._bridge.start()
+            print("[Auto] Supabase bridge started.")
+
         self.event_queue.put_nowait(StreamEvent(type=EventType.STREAM_START))
         print(f"[Auto] Engine started.  Mode: {self.mode}  "
               f"Persona: {self.persona.name}")
@@ -175,6 +195,12 @@ class AutomationEngine:
         for t in (self._dispatch_thread, self._speak_thread):
             if t:
                 t.join(timeout=3)
+
+        if self._bridge is not None:
+            # Mark session ended then close the WS
+            if self._bridge.session_id and self._api_url:
+                self._end_session()
+            self._bridge.stop()
 
         print("[Auto] Engine stopped.")
 
@@ -250,7 +276,7 @@ class AutomationEngine:
                 continue
             if event is None:
                 break
-            self.state = StreamState.LISTENING
+            self._set_state(StreamState.LISTENING)
 
             # Trigger physical reaction + hardware
             entry = _event_stimulus.get(event.type)
@@ -260,6 +286,9 @@ class AutomationEngine:
                 self.hardware.on_event(hw_tag)
             elif event.type == EventType.CHAT_MESSAGE:
                 self.reactions.stimulate(StimulusType.FUNNY, intensity=0.3)
+
+            # Report to dashboard
+            self._report_event(event)
 
             self.brain.push_event(event)
 
@@ -278,13 +307,22 @@ class AutomationEngine:
     def _on_emotion_change(self, state):
         """Called by ReactionEngine when emotional label changes."""
         self.hardware.on_emotion(state)
+        # Push state snapshot to dashboard
+        if self._bridge is not None:
+            es = self.reactions.state
+            self._bridge.report_state(
+                state_label=self.state.name.lower(),
+                emotion_valence=es.valence,
+                arousal=es.arousal,
+                creator_slug=self.creator.slug,
+            )
 
     def _speak_loop(self):
         while self._running:
             try:
                 priority, ts, text = self._speak_q.get(timeout=1.0)
             except queue.Empty:
-                self.state = StreamState.IDLE
+                self._set_state(StreamState.IDLE)
                 continue
             if text is None:
                 break
@@ -296,7 +334,7 @@ class AutomationEngine:
                 timeout -= 1
 
             is_event = priority <= 3
-            self.state = StreamState.REACTING if is_event else StreamState.THINKING
+            self._set_state(StreamState.REACTING if is_event else StreamState.THINKING)
             self.brain.is_speaking = True
 
             self.tts.speak(text, priority=priority,
@@ -309,12 +347,131 @@ class AutomationEngine:
     # ------------------------------------------------------------------
 
     def _on_tts_start(self, audio):
-        self.state = StreamState.SPEAKING
+        self._set_state(StreamState.SPEAKING)
         self.lipsync.on_audio_start(audio)
 
     def _on_tts_end(self):
         self.lipsync.on_audio_end()
-        self.state = StreamState.IDLE
+        self._set_state(StreamState.IDLE)
+
+    # ------------------------------------------------------------------
+    # Bridge helpers
+    # ------------------------------------------------------------------
+
+    def _set_state(self, new_state: StreamState):
+        """Update state and push a snapshot to the bridge."""
+        self.state = new_state
+        if self._bridge is not None:
+            es = self.reactions.state
+            self._bridge.report_state(
+                state_label=new_state.name.lower(),
+                emotion_valence=es.valence,
+                arousal=es.arousal,
+                creator_slug=self.creator.slug,
+            )
+
+    def _report_event(self, event: StreamEvent):
+        """Forward a stream event to the bridge for DB logging."""
+        if self._bridge is None:
+            return
+        try:
+            self._bridge.report_event({
+                'event_type': event.type.name.lower(),
+                'user_name':  getattr(event, 'user', '') or '',
+                'message':    getattr(event, 'message', '') or '',
+                'amount':     getattr(event, 'amount', 0) or 0,
+                'metadata':   getattr(event, 'metadata', {}) or {},
+            })
+        except Exception as e:
+            print(f"[Auto] Bridge report_event failed: {e}")
+
+    def _handle_bridge_command(self, cmd: dict):
+        """
+        Handle a command received from the dashboard via the bridge.
+
+        Supported actions:
+          switch_creator  { slug: str }
+          inject_event    { event: { event_type, user_name, message, amount } }
+          set_mode        { mode: str }  — hype/chill/focus/roast/wholesome
+        """
+        action = cmd.get('action')
+
+        if action == 'switch_creator':
+            slug = cmd.get('slug', '')
+            if slug and self.on_switch_creator is not None:
+                print(f"[Auto] Bridge command: switch_creator → {slug}")
+                self.on_switch_creator(slug)
+
+        elif action == 'inject_event':
+            ev_data = cmd.get('event', {})
+            try:
+                event = StreamEvent(
+                    type=EventType[ev_data.get('event_type', 'chat_message').upper()],
+                    user=ev_data.get('user_name', 'dashboard'),
+                    message=ev_data.get('message', ''),
+                    amount=int(ev_data.get('amount', 0)),
+                )
+                self.event_queue.put_nowait(event)
+                print(f"[Auto] Bridge command: inject_event {event.type.name}")
+            except (KeyError, ValueError) as e:
+                print(f"[Auto] inject_event bad payload: {e}")
+
+        elif action == 'set_mode':
+            mode = cmd.get('mode', '')
+            _mode_stimuli = {
+                'hype':      (StimulusType.ANTICIPATION, 0.9),
+                'chill':     (StimulusType.PLEASANT_STIMULUS, 0.5),
+                'focus':     (StimulusType.IDLE, 0.3),
+                'roast':     (StimulusType.FUNNY, 0.8),
+                'wholesome': (StimulusType.WARMTH, 0.7),
+            }
+            if mode in _mode_stimuli:
+                stim, intensity = _mode_stimuli[mode]
+                self.reactions.stimulate(stim, intensity=intensity)
+                print(f"[Auto] Bridge command: set_mode → {mode}")
+
+        else:
+            print(f"[Auto] Unknown bridge command action: {action}")
+
+    def _create_session(self):
+        """POST to /api/sessions to register this stream, store session_id."""
+        import urllib.request
+        import urllib.error
+        body = json.dumps({
+            'creator_id': self.creator.slug,
+            'platform':   'auto',
+        }).encode()
+        req = urllib.request.Request(
+            f'{self._api_url}/api/sessions',
+            data=body,
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read())
+                self._bridge.session_id = data['id']
+                print(f"[Auto] Session created: {data['id']}")
+        except Exception as e:
+            print(f"[Auto] Could not create session: {e}")
+
+    def _end_session(self):
+        """PATCH the session to status=ended on shutdown."""
+        import urllib.request
+        sid = self._bridge.session_id
+        if not sid:
+            return
+        body = json.dumps({'status': 'ended'}).encode()
+        req = urllib.request.Request(
+            f'{self._api_url}/api/sessions/{sid}',
+            data=body,
+            headers={'Content-Type': 'application/json'},
+            method='PATCH',
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5)
+        except Exception:
+            pass  # Best-effort on shutdown
 
     # ------------------------------------------------------------------
     # Helpers

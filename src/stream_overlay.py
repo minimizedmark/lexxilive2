@@ -8,6 +8,7 @@ Voice and avatar switch together atomically when the operator presses N/P/1-9.
 
 import cv2
 import numpy as np
+import os
 import time
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from .creator import Creator, discover_creators
 from .voice import VoiceEngine
 from .tts import TTSEngine
 from .automation import AutomationEngine
+from .supabase_bridge import SupabaseBridge
 
 
 MODES = ['face', 'replace', 'overlay', 'pip']
@@ -198,6 +200,18 @@ class AIInfluencerStream:
                         else 'en',
                     voice_engine=self.voice,
                 )
+
+                # Build bridge from env vars if configured
+                bridge = None
+                bridge_url = os.environ.get('SUPABASE_BRIDGE_URL', '').strip()
+                if bridge_url:
+                    bridge = SupabaseBridge(ws_url=bridge_url)
+                    print(f"[Stream] Supabase bridge → {bridge_url}")
+                else:
+                    print("[Stream] SUPABASE_BRIDGE_URL not set; running without bridge.")
+
+                api_url = os.environ.get('SUPABASE_API_URL', '').strip()
+
                 self.automation = AutomationEngine(
                     creator=current_creator,
                     tts_engine=tts,
@@ -206,7 +220,12 @@ class AIInfluencerStream:
                     twitch_channel=twitch_channel,
                     youtube_video_id=youtube_video_id,
                     youtube_channel_id=youtube_channel_id,
+                    bridge=bridge,
+                    api_url=api_url,
                 )
+                # Let the bridge forward switch_creator commands to the deck
+                self.automation.on_switch_creator = self._switch_to_creator_by_slug
+
                 # Calibrate lip sync on the first avatar
                 try:
                     first_avatar = self.deck.current.get_resized(400, 560)
@@ -567,6 +586,24 @@ class AIInfluencerStream:
         if isinstance(self.deck, _CreatorAvatarDeck):
             return self.deck.current_creator()
         return None
+
+    def _switch_to_creator_by_slug(self, slug: str):
+        """
+        Switch the active creator by slug — called from the bridge command handler.
+        Runs in the bridge background thread, but deck/voice ops are thread-safe.
+        """
+        if not isinstance(self.deck, _CreatorAvatarDeck):
+            return
+        for i, creator in enumerate(self.deck._creators):
+            if creator.slug == slug:
+                self.deck.select(i)
+                self._on_creator_switch()
+                # Update the automation engine's active creator reference
+                if self.automation is not None:
+                    self.automation.creator = creator
+                print(f"[Stream] Bridge switched creator → {creator.name}")
+                return
+        print(f"[Stream] Bridge: creator slug '{slug}' not found in deck.")
 
     def _toast(self, msg: str, duration: float = 2.0):
         self._toast_msg = msg
