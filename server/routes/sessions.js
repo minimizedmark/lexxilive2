@@ -108,6 +108,48 @@ router.get('/', async (req, res) => {
   }
 });
 
+// POST /api/sessions/:id/end — convenience endpoint
+router.post('/:id/end', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('stream_sessions')
+      .update({ status: 'ended', ended_at: new Date().toISOString() })
+      .eq('id', req.params.id)
+      .select()
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') return res.status(404).json({ error: 'Session not found' });
+      throw error;
+    }
+    res.json(data);
+  } catch (err) {
+    console.error('[sessions] end error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sessions/command — dashboard sends a command to the Python engine
+// via the stream_commands table (picked up by Supabase Realtime in stream_bridge)
+router.post('/command', async (req, res) => {
+  try {
+    const { action, payload = {}, session_id = null } = req.body;
+    if (!action) return res.status(400).json({ error: 'action is required' });
+
+    const { data, error } = await supabase
+      .from('stream_commands')
+      .insert({ action, payload, session_id })
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (err) {
+    console.error('[sessions] command error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
