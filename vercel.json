@@ -1,11 +1,7 @@
 {
-  "version": 2,
-  "buildCommand": "cd server && npm install",
-  "outputDirectory": "server",
-  "builds": [
-    { "src": "server/index.js", "use": "@vercel/node" }
-  ],
-  "routes": [
-    { "src": "/(.*)", "dest": "server/index.js" }
-  ]
+  "framework": "nextjs",
+  "rootDirectory": "dashboard",
+  "buildCommand": "npm run build",
+  "outputDirectory": ".next",
+  "installCommand": "npm install"
 }
