@@ -3,6 +3,3 @@ main.py
 generate_avatar.py
 manage_creators.py
 install.sh
-src/
-creators/
-supabase/
