@@ -12,6 +12,7 @@
 import 'dotenv/config';
 import http from 'http';
 import express from 'express';
+import cors from 'cors';
 
 import creatorsRouter from './routes/creators.js';
 import assetsRouter   from './routes/assets.js';
@@ -26,6 +27,7 @@ const PORT = process.env.PORT || 3000;
 // ---------------------------------------------------------------------------
 // Middleware
 // ---------------------------------------------------------------------------
+app.use(cors({ origin: '*' }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
